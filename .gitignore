@@ -19,3 +19,6 @@ aris
 
 # research notes / docs (kept local)
 *.md
+
+# pre-git manual backups (preserved in commit 30480b7)
+*.bak_*
