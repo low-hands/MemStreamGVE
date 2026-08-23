@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+
+# checkpoints / model weights (symlinked or downloaded out of tree)
+checkpoints
+wan_models
+longlive_models
+
+# outputs
+videos
+logs
+
+# stray macOS / editor junk
+.DS_Store
+._*
+
+# unrelated local binary (macOS arm64, not referenced by the project)
+aris
+
+# research notes / docs (kept local)
+*.md
