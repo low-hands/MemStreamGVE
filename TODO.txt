@@ -1,0 +1,106 @@
+TODO
+====
+(TODO.txt, not .md — *.md is gitignored in this repo)
+
+
+[1] BASELINES ARE NOT PORTED  -- blocking for the experiments table
+-------------------------------------------------------------------
+StreamGVE's pipeline/causal_inference.py was NOT carried over; MemFlow's own
+causal_inference.py (memory bank) took its place, which is correct for the
+substrate but means the comparison methods came along with the file that was
+dropped.
+
+Missing mode branches (upstream StreamGVE, both backends, in causal_inference.py):
+    'uni-inv'    inversion baseline                     kwargs: alpha
+    'uni-edit'   UniEdit-Flow                           kwargs: alpha, omega (default 5.0)
+    'flowedit'   FlowEdit    kwargs: n_avg, n_min, n_max, src/trg_guidance_scale
+    'sdedit'     SDEdit                                 kwargs: strength
+
+Notes:
+  - omega belongs to UniEdit-Flow, not to StreamGVE's own method.
+  - Upstream never wires mode_kwargs from any CLI or script: the mode branches
+    are unreachable in the released code. The authors presumably drove them
+    from their own harness, which was not published.
+  - Porting them means adapting each branch to MemFlow's bank + block loop.
+    Not a copy-paste.
+
+Reference: /Users/guorui/Downloads/StreamGVE-main/LongLive_StreamGVE/pipeline/causal_inference.py
+
+
+[2] MASK -- current work direction
+-----------------------------------
+The source/foreground mask is the bottleneck: it is not instance-selective, so
+a semantically close neighbour gets edited too (pepper -> tomato also hits an
+egg in a nearby bowl). A wrong mask at block 0 cannot be recovered downstream,
+and with a persistent bank it is written into memory rather than washed out.
+
+Untuned knobs, none currently reachable from the CLI:
+  - fg_scale     hardcoded 1.0 in edit_causal_inference.py (upstream default too).
+                 The real threshold knob: fg is decided by
+                     fg_scale * mean_attn(trigger tokens) > mean_attn(other tokens)
+                 Upstream doc: "larger fg_scale will release the mask standard".
+                 mask_bin = mask_soft > 0 is NOT the tunable part; fg_scale is.
+  - mask_layers  hardcoded range(20) of 30 layers, no rationale recorded upstream.
+  - spatial coherence: none. Largest-connected-component filtering is O(n),
+    per block, streaming-compatible, and targets the neighbour-object case.
+
+Next step: expose fg_scale + mask_layers, sweep on the pepper/egg clip, inspect
+the overlays already dumped by --debug_mask_dir. Determine whether the wrong
+object is marginally over threshold or strongly activated -- the two cases need
+different fixes.
+
+RULED OUT: SAM. Only the first block can be segmented (streaming), so coverage
+of later blocks depends on mask propagation -- and propagation is already known
+here to be harmful, see the comment at edit_causal_inference.py:419
+("Do not directly propagate previous block masks; that can spread mask leakage
+into memory", from the 2026-08-04 maskprop probe). SAM also fails outright on
+many clips. Do not revisit.
+
+
+[3] BANK -- status
+-------------------
+FIXED   target bank was materialized twice per block (explicit _materialize_kv_bank
+        before the dual pass + q_bank=True on the clean target forward), so the
+        same block was appended twice and an extra real history slot evicted.
+        Native MemFlow passes q_bank=True exactly once per block
+        (pipeline/causal_inference.py:180). Now made idempotent via k_new_pending.
+        Banks without that key (native inference/training) keep the old behavior.
+
+FIXED   src/trg bank pointer drift is now a loud RuntimeError in _concat_kv_bank
+        instead of silently mixing KV from different history blocks.
+
+OPEN    src/trg slot misalignment. Two causes: (a) the double-write above, now
+        fixed; (b) the two banks run compress_kv_bank independently, with their
+        own keys and their own crossattn cache (src prompt vs trg prompt), so
+        they select different history blocks. (b) is a design question, not a
+        bug -- whose selection wins? Decide only after re-measuring: rerun
+        block0_run.sh and read id_match. Whatever misalignment survives is the
+        net contribution of (b).
+
+DEFERRED (MemFlow-native, not introduced here -- revisit via experiments)
+        - bank slot content is a hard slice, new_k[:, :1560] = first latent frame
+          of the block; no pooling. 1 frame kept out of every 9.
+        - compress_kv_bank saliency uses the text cross-attn K as a query against
+          visual self-attn K (different projection spaces), then averages raw
+          logits over heads and tokens -- ranking is close to a key-norm sort.
+        - eviction is greedy and myopic: hist is only the 3 live slots, never the
+          full history; an evicted block is gone for good.
+        - bank stores post-RoPE K and is not re-positioned on read; topk also
+          reorders slots, so bank-internal temporal order is not monotonic.
+        - record_interval only gates the read path and the pointer; the write
+          path turns over every block.
+
+
+[4] MEASUREMENT -- both gates need redoing
+-------------------------------------------
+- The existing G0 verdict is unusable: it was produced with the double-write bug
+  live, and the first misalignment (block=30) coincides with the bank filling up,
+  so cut-induced and bug-induced degradation cannot be separated. Rerun
+  refine-logs/block0_run.sh against the fixed code first.
+- refine-logs/probe_transport.py has never run: no block1_out, no probe_pairs.json.
+  It needs 20-30 two-shot pairs with clean masks. Use a labelled source
+  (DAVIS / YouTube-VOS ground-truth masks) rather than SAM -- see [2]. The probe
+  is offline and does not need to be streaming-compatible.
+- Wiring to override current_src_fg_mask from an external mask file is not done
+  (~10 lines). Needed so the probe can be run with clean masks and with the real
+  trigger mask through the same code path.
