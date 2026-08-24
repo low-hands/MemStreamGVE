@@ -783,6 +783,21 @@ class CausalWanSelfAttention(nn.Module):
                                 sink_local_mass = prev_mass[prev_sink_local_mask].sum().item() if prev_sink_local_mask.any() else 0.0
                                 current_mass = probs_dbg[prev_len:prev_len + cur_len].sum().item()
 
+                                # Split the bank's share into foreground / background so we can
+                                # tell what future queries actually retrieve from long-term
+                                # memory. Foreground is ~5% of bank tokens, so a foreground
+                                # share well above that means the bank is read for edited
+                                # identity; a share near 5% means it only supplies generic
+                                # scene context. `bank_fg_frac` is the fg fraction of bank
+                                # tokens, for reference.
+                                b_fg = trg_prev_fg_mask[b_idx]
+                                bank_fg_sel = prev_bank_mask & b_fg
+                                bank_bg_sel = prev_bank_mask & (~b_fg)
+                                bank_fg_mass = prev_mass[bank_fg_sel].sum().item() if bank_fg_sel.any() else 0.0
+                                bank_bg_mass = prev_mass[bank_bg_sel].sum().item() if bank_bg_sel.any() else 0.0
+                                n_bank = int(prev_bank_mask.sum().item())
+                                bank_fg_frac = (int(bank_fg_sel.sum().item()) / n_bank) if n_bank else 0.0
+
                                 total = bank_mass + sink_local_mass + current_mass + 1e-8
                                 line = (
                                     f"[ATTN_MASS] "
@@ -790,6 +805,9 @@ class CausalWanSelfAttention(nn.Module):
                                     f"bank={bank_mass / total:.4f} "
                                     f"sink_local={sink_local_mass / total:.4f} "
                                     f"current={current_mass / total:.4f} "
+                                    f"bank_fg={bank_fg_mass / total:.4f} "
+                                    f"bank_bg={bank_bg_mass / total:.4f} "
+                                    f"bank_fg_frac={bank_fg_frac:.4f} "
                                     f"prev_len={prev_len} cur_len={cur_len} sample_q={sample_q}\\n"
                                 )
                                 with open(attn_mass_log, "a", encoding="utf-8") as f:
