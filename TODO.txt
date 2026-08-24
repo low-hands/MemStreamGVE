@@ -17,7 +17,12 @@ Missing mode branches (upstream StreamGVE, both backends, in causal_inference.py
     'sdedit'     SDEdit                                 kwargs: strength
 
 Notes:
-  - omega belongs to UniEdit-Flow, not to StreamGVE's own method.
+  - NOTE: the 'omega' in this file's uni-edit branch is NOT the paper's omega.
+    The paper (arXiv 2605.21466v2, Eq.8) defines omega as the cross-attention
+    boosting scale = fg_boost_factor in our code, and rho (Eq.4) as the
+    self-attention blending ratio = blend_power. Both are already exposed on
+    our CLI. The identically-named variable in causal_inference.py belongs to
+    the UniEdit-Flow baseline and is unrelated.
   - Upstream never wires mode_kwargs from any CLI or script: the mode branches
     are unreachable in the released code. The authors presumably drove them
     from their own harness, which was not published.

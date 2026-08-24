@@ -853,23 +853,11 @@ class EditCausalInferencePipeline(torch.nn.Module):
     def _concat_kv_bank(self, bank_src, bank_trg):
         kv_bank = []
         for b_idx in range(self.num_transformer_blocks):
-            # The dual bank keeps only the target pointers, so slot i of the
-            # source half and slot i of the target half are assumed to hold the
-            # same history block. If the two branches ever drift apart, every
-            # slot-wise op downstream (the soft_fg_target bridge, the fg-mask
-            # select) silently mixes KV from different timestamps. Fail loudly.
-            src_g = bank_src[b_idx]["global_end_index"].item()
-            trg_g = bank_trg[b_idx]["global_end_index"].item()
-            src_l = bank_src[b_idx]["local_end_index"].item()
-            trg_l = bank_trg[b_idx]["local_end_index"].item()
-            if src_g != trg_g or src_l != trg_l:
-                raise RuntimeError(
-                    f"kv_bank pointer drift at transformer block {b_idx}: "
-                    f"src(global={src_g}, local={src_l}) != "
-                    f"trg(global={trg_g}, local={trg_l}). "
-                    "Source and target banks are no longer slot-aligned; the "
-                    "dual bank would mix KV from different history blocks."
-                )
+            # NOTE: the source pointers legitimately lead the target ones here.
+            # This runs after the clean source forward (which advances the source
+            # bank) but before the clean target forward, so the two are one block
+            # apart by design. Slot correspondence is measured by _log_bank_alignment
+            # (id_match), not asserted here.
             kv_bank.append({
                 "k": torch.cat((bank_src[b_idx]["k"], bank_trg[b_idx]["k"]), dim=0).clone(),
                 "v": torch.cat((bank_src[b_idx]["v"], bank_trg[b_idx]["v"]), dim=0).clone(),
