@@ -397,13 +397,15 @@ class EditCausalInferencePipeline(torch.nn.Module):
             # Materialize the latest clean target block into MemFlow bank before
             # building the dual branch. The normal target q_bank call happens
             # after dual denoising, which is too late for the next block's edit.
-            self._materialize_kv_bank(kv_bank_trg, crossattn_cache_trg)
+            if not self._bank_single():
+                self._materialize_kv_bank(kv_bank_trg, crossattn_cache_trg)
 
             # Build dual cache/bank after the clean source forward so MemFlow's
             # bank materialization from q_bank=True is visible to the dual pass.
             shared_dict_dual = dict()
             kv_cache_dual = self._concat_kv_cache(kv_cache_src, kv_cache_trg, shared_dict=shared_dict_dual)
-            kv_bank_dual = self._concat_kv_bank(kv_bank_src, kv_bank_trg)
+            _bank_second = kv_bank_src if self._bank_single() else kv_bank_trg
+            kv_bank_dual = self._concat_kv_bank(kv_bank_src, _bank_second)
             self._log_bank_alignment(
                 kv_bank_dual,
                 block_start=current_start_frame,
@@ -563,7 +565,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=crossattn_cache_trg,
                 kv_bank=kv_bank_trg,
                 update_bank=True,
-                q_bank=True,
+                q_bank=not self._bank_single(),
                 update_cache=True,
                 current_start=current_start_frame * self.frame_seq_length,
             )
@@ -571,6 +573,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
             _, trg_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_trg)
             current_trg_fg_mask = trg_fg_mask_bin | src_fg_mask_bin
             self._set_kv_bank_new_mask(kv_bank_trg, current_trg_fg_mask)
+            if self._bank_single():
+                self._compose_single_bank(kv_bank_src, kv_bank_trg)
             self._update_trg_fg_mask_cache(trg_fg_mask_cache, current_trg_fg_mask, kv_cache_trg)
             self._kv_cache_to(kv_cache_trg, 'cpu', low_memory)
             
@@ -992,6 +996,28 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 )
 
 
+    @staticmethod
+    def _bank_single():
+        import os as _os
+        return _os.environ.get("BANK_SINGLE", "0") == "1"
+
+    def _compose_single_bank(self, kv_bank_src, kv_bank_trg):
+        """Fold the target branch into the source bank's pending slot.
+
+        Edit-region tokens take the target KV and everything else keeps the
+        source KV, so one stored frame carries the edit and no second bank is
+        needed. Called once per block, after both branches have written their
+        k_new and the union mask is known.
+        """
+        import torch as _torch
+        for layer in range(self.num_transformer_blocks):
+            bank_s = kv_bank_src[layer]
+            bank_t = kv_bank_trg[layer]
+            fg = bank_t["fg_mask_new"][:, :, None, None]
+            bank_s["k_new"].copy_(_torch.where(fg, bank_t["k_new"], bank_s["k_new"]))
+            bank_s["v_new"].copy_(_torch.where(fg, bank_t["v_new"], bank_s["v_new"]))
+            bank_s["fg_mask_new"].copy_(bank_t["fg_mask_new"])
+
     def _materialize_kv_bank(self, kv_bank, crossattn_cache):
         model = self.generator.model
         if hasattr(model, "get_base_model"):
@@ -1077,6 +1103,12 @@ class EditCausalInferencePipeline(torch.nn.Module):
             out_path = os.path.join(debug_mask_dir, f"block_{block_start:04d}_srcmask.mp4")
             iio.imwrite(out_path, frames, fps=16)
 
+            import numpy as _np
+            _np.save(
+                os.path.join(debug_mask_dir, f"block_{block_start:04d}_srcmask.npy"),
+                mask_seq.detach().float().cpu().numpy().astype("float16"),
+            )
+
     def _dump_velocity_mask_overlay(self, latent_block, mask_map, block_start, step_index, debug_dir):
         if not debug_dir:
             return
@@ -1114,6 +1146,14 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
             out_path = os.path.join(debug_dir, f"block_{block_start:04d}_step_{step_index:03d}_velmask.mp4")
             iio.imwrite(out_path, frames, fps=16)
+
+            # _RAW_MASK_DUMP: the array that actually gates the latent update,
+            # at latent resolution, before any overlay blending.
+            import numpy as _np
+            _np.save(
+                os.path.join(debug_dir, f"block_{block_start:04d}_step_{step_index:03d}_velmask.npy"),
+                mask_map.detach().float().cpu().numpy().astype("float16"),
+            )
 
     def _aggregate_crossattn_mask(self, crossattn_cache, size=None, patch=(1, 2, 2), scale_factor=1):
         '''
