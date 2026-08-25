@@ -261,12 +261,30 @@ class WanT2VCrossAttention(WanSelfAttention):
             for fg_idx in fg_indices:
                 mask_value = torch.zeros_like(v[:1])
                 if len(fg_idx):
-                    mask_value += -1 / (v.size(1) - len(fg_idx))
+                    import os as _os
+                    _eq7 = _os.environ.get("MASK_EQ7", "0") == "1"
+                    _plen = crossattn_cache.get("prompt_len", None)
+                    if _eq7 and _plen:
+                        # Eq.7: background term over the real prompt tokens only,
+                        # padding weighted 0 so it cannot dilute the comparison.
+                        _L = min(int(_plen), v.size(1))
+                        _den = max(_L - len(fg_idx), 1)
+                        mask_value[:, :_L] += -1 / _den
+                    else:
+                        mask_value += -1 / (v.size(1) - len(fg_idx))
                     mask_value[:, fg_idx] = crossattn_cache.get("fg_scale", 1) / len(fg_idx)
                 mask_value_list.append(mask_value)
             if len(mask_value_list) == 1:
                 mask_value_list = mask_value_list * b
 
+            if not globals().get("_MASK_THR_PROBE", False):
+                globals()["_MASK_THR_PROBE"] = True
+                _Lk = v.size(1)
+                _nf = len(fg_indices[0]) if fg_indices else 0
+                _sc = float(crossattn_cache.get("fg_scale", 1))
+                _thr = _nf / (_sc * (_Lk - _nf) + _nf) if _nf else float("nan")
+                print(f"[MASK_THR] Lk(v.size(1))={_Lk}  n_trigger={_nf}  fg_scale={_sc}  "
+                      f"=> foreground iff attn_on_trigger > {_thr*100:.3f}%", flush=True)
             mask_value = torch.cat(mask_value_list, dim=0)
             mask_soft = flash_attention(q, k, mask_value, k_lens=context_lens).mean(dim=[2, 3], keepdim=True)
             crossattn_cache["obtain_mask"] = False

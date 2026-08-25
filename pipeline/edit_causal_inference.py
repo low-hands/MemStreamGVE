@@ -273,7 +273,20 @@ class EditCausalInferencePipeline(torch.nn.Module):
             idx for phrase in trg_trigger_words
             for idx in find_phrase_token_indices(trans_tokenizer, [prompt], phrase)[0]
         ]) for prompt in trg_prompts]
-        print(tok_src, tok_trg)
+        def _prompt_token_len(text):
+            try:
+                enc = trans_tokenizer(text, padding=False, truncation=False,
+                                      add_special_tokens=True, return_attention_mask=False,
+                                      return_tensors=None)
+                pad_id = getattr(trans_tokenizer, "pad_token_id", None)
+                eos_id = getattr(trans_tokenizer, "eos_token_id", None)
+                return len([i for i in enc["input_ids"] if i not in {pad_id, eos_id, None}])
+            except Exception:
+                return None
+
+        src_prompt_len = _prompt_token_len(src_prompts[0])
+        trg_prompt_len = _prompt_token_len(trg_prompts[0])
+        print(tok_src, tok_trg, "prompt_len:", src_prompt_len, trg_prompt_len)
 
         self.generator.model.local_attn_size = self.local_attn_size
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
@@ -307,7 +320,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 ) * self.args.context_noise
                 # src and src mask
                 current_src_ref_latents = src_initial_latent[:, left: right]
-                self._register_crossattn_mask_gatherer(crossattn_cache_src, tok_src, layers=mask_layers, fg_scale=fg_scale)
+                self._register_crossattn_mask_gatherer(crossattn_cache_src, tok_src, layers=mask_layers, fg_scale=fg_scale, prompt_len=src_prompt_len)
                 self.generator(
                     noisy_image_or_video=current_src_ref_latents,
                     conditional_dict=src_conditional_dict,
@@ -323,7 +336,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 _, src_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_src)
                 # trg and trg mask
                 current_trg_ref_latents = trg_initial_latent[:, left: right]
-                self._register_crossattn_mask_gatherer(crossattn_cache_trg, tok_trg, layers=mask_layers, fg_scale=fg_scale)
+                self._register_crossattn_mask_gatherer(crossattn_cache_trg, tok_trg, layers=mask_layers, fg_scale=fg_scale, prompt_len=trg_prompt_len)
                 self.generator(
                     noisy_image_or_video=current_trg_ref_latents,
                     conditional_dict=trg_conditional_dict,
@@ -370,7 +383,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
             ) * self.args.context_noise
 
             # forward clean source video to get source mask, and store into kv_cache
-            self._register_crossattn_mask_gatherer(crossattn_cache_src, tok_src, layers=mask_layers, fg_scale=fg_scale)
+            self._register_crossattn_mask_gatherer(crossattn_cache_src, tok_src, layers=mask_layers, fg_scale=fg_scale, prompt_len=src_prompt_len)
             self.generator(
                 noisy_image_or_video=src_input,
                 conditional_dict=src_conditional_dict,
@@ -467,7 +480,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
                 # update mask with trg mask at t^inj=0.5
                 if index == len(denoising_step_list) // 2:
-                    self._register_crossattn_mask_gatherer(crossattn_cache_dual, tok_src + tok_trg, layers=mask_layers, fg_scale=fg_scale)
+                    self._register_crossattn_mask_gatherer(crossattn_cache_dual, tok_src + tok_trg, layers=mask_layers, fg_scale=fg_scale, prompt_len=src_prompt_len)
 
                 boost_start_index = int(len(denoising_step_list) * fg_boost_start_ratio)
                 if fg_boost_factor != 1.0 and index >= boost_start_index:
@@ -555,7 +568,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
             del kv_cache_dual
             self._kv_cache_to(kv_cache_trg, 'cuda', low_memory)
-            self._register_crossattn_mask_gatherer(crossattn_cache_trg, tok_trg, layers=mask_layers, fg_scale=fg_scale)
+            self._register_crossattn_mask_gatherer(crossattn_cache_trg, tok_trg, layers=mask_layers, fg_scale=fg_scale, prompt_len=trg_prompt_len)
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             self.generator(
                 noisy_image_or_video=denoised_pred,
@@ -1047,7 +1060,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
             crossattn_cache[l_idx]["current_src_fg_mask"] = current_src_fg_mask
             crossattn_cache[l_idx]["apply_enhance"] = True
         
-    def _register_crossattn_mask_gatherer(self, crossattn_cache, fg_indices, fg_scale=1.0, layers=range(20)):
+    def _register_crossattn_mask_gatherer(self, crossattn_cache, fg_indices, fg_scale=1.0, layers=range(20),
+                                          prompt_len=None):
         '''
         fg_indices will be poped in blocks to avoid repeating
         '''
@@ -1057,6 +1071,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         for l_idx in layers:
             crossattn_cache[l_idx]["fg_indices"] = fg_indices
             crossattn_cache[l_idx]["fg_scale"] = fg_scale
+            crossattn_cache[l_idx]["prompt_len"] = prompt_len
             crossattn_cache[l_idx]["obtain_mask"] = True
 
     def _dump_edit_mask_overlay(self, latent_block, mask_seq, block_start, debug_mask_dir, height, width):
@@ -1172,7 +1187,15 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 total_mask += crossattn_cache[l_idx]["fg_mask_soft"].squeeze(-1).squeeze(-1)
                 account += 1
         mask_soft = total_mask / account
-        mask_bin = mask_soft > 0
+        _pct = float(os.environ.get("MASK_PCT", "0") or 0)
+        if _pct > 0:
+            # Keep the top p% of tokens per batch element, so coverage is the
+            # parameter rather than a by-product of how the prompt is worded.
+            k = max(1, int(round(mask_soft.shape[-1] * _pct / 100.0)))
+            thresh = mask_soft.topk(k, dim=-1).values[..., -1:]
+            mask_bin = mask_soft >= thresh
+        else:
+            mask_bin = mask_soft > 0
         if size is None:
             mask_soft_vis = None
             mask_bin_vis = None
