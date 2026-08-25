@@ -161,6 +161,13 @@ if __name__ == '__main__':
 
     # hyper-parameters
     parser.add_argument("--fg_boost_factor", type=float, default=2.0, help='CrossAttn Boosting')
+    parser.add_argument("--fg_scale", type=float, default=1.0,
+                        help="Grounding threshold scale. Larger releases the mask standard "
+                             "(bigger mask); smaller tightens it. Paper-faithful value is "
+                             "roughly len(prompt tokens) / 512.")
+    parser.add_argument("--mask_layers", type=str, default="0-19",
+                        help="Transformer layers whose cross-attention feeds the grounding "
+                             "mask, as START-END inclusive. Default 0-19 of 30.")
     parser.add_argument("--fg_boost_start_ratio", type=float, default=0.0, help="Start applying cross-attn boost after this denoising progress ratio.")
     parser.add_argument("--blend_power", type=float, default=2.0, help='rho')
     parser.add_argument("--bridge_mode", type=str, default="normal", choices=["normal", "soft_fg_target"])
@@ -311,6 +318,9 @@ if __name__ == '__main__':
         trg_initial_latent=trg_first_frame,
 
         fg_boost_factor=args.fg_boost_factor,
+        fg_scale=args.fg_scale,
+        mask_layers=range(int(args.mask_layers.split("-")[0]),
+                          int(args.mask_layers.split("-")[1]) + 1),
         fg_boost_start_ratio=args.fg_boost_start_ratio,
         blend_power=args.blend_power,
         bridge_mode=args.bridge_mode,
